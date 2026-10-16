@@ -1,4 +1,4 @@
-import { newWebSocketRpcSession } from "capnweb";
+import { newWebSocketRpcSession, RpcTarget } from "capnweb";
 import type { SharedBindings } from "./constants";
 
 /**
@@ -351,6 +351,9 @@ export async function pipeSocketOverWebSocket(
  * Create a remote proxy stub that proxies to a remote binding via capnweb.
  *
  * Intercepts `.fetch()` to use plain HTTP; forwards other accesses to capnweb.
+ * The capnweb WebSocket session is only opened once a non-`fetch` property is
+ * accessed, so fetch-only callers (e.g. `env.NAMESPACE.get(name).fetch()`)
+ * don't create an unused RPC session.
  */
 export function makeRemoteProxyStub(
 	remoteProxyConnectionString: string,
@@ -374,7 +377,11 @@ export function makeRemoteProxyStub(
 		fetch: typeof fetch;
 		connect: never;
 	};
-	const stub = newWebSocketRpcSession(url.href) as unknown as ProxiedService;
+	let stub: ProxiedService | undefined;
+	function getStub(): ProxiedService {
+		stub ??= newWebSocketRpcSession(url.href) as unknown as ProxiedService;
+		return stub;
+	}
 
 	const headers = metadata
 		? new Headers(
@@ -384,7 +391,14 @@ export function makeRemoteProxyStub(
 			)
 		: undefined;
 
-	return new Proxy<ProxiedService>(stub, {
+	// Mirror the shape of a Cap'n Web stub (a function proxy whose prototype is
+	// an `RpcTarget`) so workerd still treats the returned value as an RPC
+	// target, without opening the session up front.
+	const target = function () {} as unknown as ProxiedService;
+	return new Proxy<ProxiedService>(target, {
+		getPrototypeOf() {
+			return RpcTarget.prototype;
+		},
 		get(_, p) {
 			if (p === "fetch") {
 				return makeFetch(
@@ -395,7 +409,17 @@ export function makeRemoteProxyStub(
 					loopback
 				);
 			}
-			return Reflect.get(stub, p);
+			// workerd checks whether RPC return values are thenable, and disposes
+			// them once the caller is done. Answer both without opening a session:
+			// a Cap'n Web main stub has no `then`, and there's nothing to dispose
+			// if the session was never opened.
+			if (p === "then") {
+				return undefined;
+			}
+			if (p === Symbol.dispose && stub === undefined) {
+				return () => {};
+			}
+			return Reflect.get(getStub(), p);
 		},
 	});
 }
